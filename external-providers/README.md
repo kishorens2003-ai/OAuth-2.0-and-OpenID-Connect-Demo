@@ -989,3 +989,158 @@ The following are not implemented in this demo but are required before deploying
 | **Rate limiting on `/login` and `/callback`** | Prevent brute-force and DoS against the OAuth endpoints. |
 | **Use `sub` not `email` as user ID** | Email addresses can change. `sub` is stable and unique forever. |
 | **Handle token revocation** | If a user revokes your app's access in their Google account, your next API call will fail. Handle `401` responses by clearing the session. |
+
+---
+
+## 11. Further Mastery Path
+
+This project is Level 1. Here is the full progression from where you are now to complete mastery of OAuth 2.0 and OpenID Connect.
+
+---
+
+### Level 1 — Done (this project)
+
+You have built a production-pattern web app that talks to Google as an external provider.
+
+- Authorization Code Flow with PKCE
+- CSRF protection via state parameter
+- ID token cryptographic verification (signature, issuer, audience, expiry)
+- Server-side sessions (opaque session ID in cookie, all data on server)
+- Automatic token refresh via `oauth2.TokenSource`
+- Auth middleware (`requireAuth`) as a gatekeeper
+- Calling a real Google API (Drive) with an access token
+
+**The gap at this level:** You are fully dependent on Google. If Google is down, your login is down. Your users must have a Google account. You have no control over the auth infrastructure.
+
+---
+
+### Level 2 — Provider Agnostic (next step)
+
+**Goal:** Prove to yourself that the protocol is the thing, not the provider. Make your app work with multiple providers by changing only two values.
+
+**What to build:** Refactor `main.go` so it supports multiple providers simultaneously.
+
+```
+/login/google   → Auth Code flow with Google
+/login/github   → Auth Code flow with GitHub (note: GitHub uses OAuth 2.0 but not OIDC)
+/login/local    → Auth Code flow with self-hosted server (localhost:9000)
+
+/callback       → Single shared callback that identifies which provider was used
+```
+
+**The key insight you will confirm:** The callback handler — state verification, PKCE, token exchange, ID token verification, session creation — is **identical** for every provider. Only the `oidc.NewProvider()` URL and the client credentials differ.
+
+```go
+// All of these work with the exact same callback code:
+providers := map[string]*oidc.Provider{
+    "google": oidc.NewProvider(ctx, "https://accounts.google.com"),
+    "local":  oidc.NewProvider(ctx, "http://localhost:9000"),
+}
+```
+
+**Mastery signal:** When you add a third provider (e.g. Okta) by adding one entry to a map and two environment variables, with zero changes to the callback logic.
+
+---
+
+### Level 3 — Self-Hosted Auth Server
+
+**Goal:** Become the provider. Stop depending on Google for authentication entirely.
+
+**What to build:** Move to the `../self-hosted/` directory. You now run your own auth server that issues JWTs signed with your own RSA key. Your apps are completely independent of any third party for authentication.
+
+```
+external-providers/main.go   → points at https://accounts.google.com
+self-hosted/webapp/main.go   → points at http://localhost:9000
+
+Change: two strings.
+Everything else: identical.
+```
+
+**What you learn by building the auth server:**
+- How JWTs are actually constructed and signed (RSA-SHA256, base64url encoding)
+- What OIDC Discovery is and why it matters (how clients auto-configure)
+- How JWKS works (public key distribution for signature verification)
+- How PKCE is verified server-side (SHA-256 challenge/verifier check)
+- Why access tokens and ID tokens have different audiences
+- How device flow polling works at the HTTP level
+- How client credentials flow eliminates users from the picture entirely
+
+**Mastery signal:** You can explain why `go-oidc`'s `verifier.Verify()` produces the same result whether the token came from Google or your `localhost:9000` server. The answer: it only cares about the RSA signature and the claims. The signer's identity is irrelevant as long as the math checks out.
+
+---
+
+### Level 4 — Hybrid Federation
+
+**Goal:** Run your own auth server that also accepts Google/GitHub login internally. Your apps talk to one server. That server handles the federation.
+
+```
+Your Apps → Your Auth Server → (optionally) → Google / GitHub / LDAP
+                            ↓
+                    Issues uniform tokens
+                    to all your services
+                    regardless of how
+                    the user authenticated
+```
+
+**What to build:** Add an "external identity provider" flow to `self-hosted/authserver/main.go`:
+1. Add a `/login/google` endpoint on the auth server itself
+2. The auth server does the OAuth flow with Google (it becomes the client)
+3. On success, the auth server creates a local user (or maps to existing) and issues its own JWT
+4. Your webapp and APIs never see Google's tokens — only your auth server's tokens
+
+**Why this matters in production:**
+- One consistent token format for all your services
+- Add/remove external providers without touching your apps
+- Merge accounts (user who logged in via Google and via password are the same person)
+- Enforce your own session and MFA policies on top of external providers
+
+**Mastery signal:** A user logs in with Google on your webapp. Your webapp's session token has `iss: "http://auth.yourdomain.com"` — not Google's issuer. Your apps are completely decoupled from Google at the token level.
+
+---
+
+### Level 5 — Machine-to-Machine at Scale
+
+**Goal:** Extend self-hosted auth to cover all server-to-server communication in a multi-service architecture.
+
+**What to build:**
+
+```
+Service Registry (in Keycloak/authserver):
+  payment-service:   secret, allowed scopes: [payments:process]
+  inventory-service: secret, allowed scopes: [inventory:read, inventory:write]
+  reporting-service: secret, allowed scopes: [transactions:read, inventory:read]
+  notification-service: secret, allowed scopes: [notifications:send]
+```
+
+Each service gets a token from the auth server at startup. Every inter-service HTTP call carries a Bearer token. Each service validates tokens locally using the JWKS public key.
+
+**Advanced patterns to add:**
+- Token exchange ([RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693)): Service A acts on behalf of a user when calling Service B — the user's token is "exchanged" for a new token with Service B as the audience
+- Short-lived tokens (5–15 minutes) with no refresh tokens for M2M — simpler and more secure than long-lived tokens when calling `/token` is cheap
+
+**Mastery signal:** You can draw the full token flow for a request that goes: Browser → API Gateway → Auth Service → Payment Service → Notification Service, showing which token each leg uses and why.
+
+---
+
+### Level 6 — Mastery Proof
+
+**The test:** Take `self-hosted/webapp/main.go`. Change one line:
+
+```go
+// From:
+provider, _ := oidc.NewProvider(ctx, "http://localhost:9000")
+
+// To:
+provider, _ := oidc.NewProvider(ctx, "https://your-keycloak.yourdomain.com/realms/myrealm")
+```
+
+Update the client credentials. Run the webapp. It works — login, session, token refresh, everything.
+
+Then change it to point at Okta. It works.
+Then change it back to `localhost:9000`. It works.
+
+**If this feels obvious to you — you have mastered the protocol.**
+
+The app does not know or care which server issued the tokens. It only knows the OIDC Discovery URL and its client credentials. The rest is mathematics: RSA signatures, base64url encoding, JSON claims. The source of those signatures is irrelevant as long as they verify correctly against the JWKS public keys.
+
+That is what "OAuth 2.0 and OpenID Connect are protocols, not products" means in practice.
