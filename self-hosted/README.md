@@ -1033,3 +1033,283 @@ Having implemented and understood the full stack, here is the natural progressio
 
 **Level 4 — Mastery Proof**
 Replace this educational auth server with **Ory Hydra** by changing only the discovery URL and client credentials in the four client applications. If everything still works, you have mastered the protocol. The apps don't know or care which server signed the tokens.
+
+---
+
+**Level 5 — Build Your Own PingFederate + Authz (Enterprise Architecture)**
+
+This is the real-world architecture used by companies like Autodesk. You build two separate systems that together form a production-grade identity platform.
+
+---
+
+### Part A — Harden the Auth Server into Your Own "PingFederate"
+
+Take `authserver/main.go` and evolve it into a persistent, clusterable, production-grade Authorization Server. This is what PingFederate is — an enterprise product that does exactly what our auth server does, but hardened for scale.
+
+**Persistent Storage — replace in-memory maps with PostgreSQL:**
+
+```
+Current (demo):                    Production target:
+  users   map[string]*User    →    users table (PostgreSQL)
+  clients map[string]*Client  →    oauth_clients table
+  authCodes map[...]           →    auth_codes table (TTL-indexed)
+  refreshTokens map[...]       →    refresh_tokens table
+  deviceCodes map[...]         →    device_codes table
+```
+
+```sql
+-- oauth_clients table
+CREATE TABLE oauth_clients (
+    client_id     TEXT PRIMARY KEY,
+    client_secret TEXT,              -- bcrypt hashed
+    name          TEXT,
+    public        BOOLEAN,
+    grant_types   TEXT[],
+    redirect_uris TEXT[],
+    scopes        TEXT[],
+    created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+-- refresh_tokens table
+CREATE TABLE refresh_tokens (
+    token      TEXT PRIMARY KEY,
+    client_id  TEXT REFERENCES oauth_clients,
+    user_id    TEXT,
+    scopes     TEXT[],
+    expires_at TIMESTAMPTZ,
+    revoked    BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+**RSA Key Persistence — load from AWS KMS or HashiCorp Vault instead of generating fresh:**
+
+```go
+// Current (demo — key lost on restart, all tokens invalid):
+privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+
+// Production — load from Vault:
+secret, _ := vaultClient.Logical().Read("secret/authserver/signing-key")
+privateKey, _ := x509.ParsePKCS1PrivateKey(secret.Data["key"].([]byte))
+
+// Or from AWS KMS (asymmetric key — KMS holds private key, never exposed):
+// Sign with KMS API, verify with public key from KMS
+```
+
+**Key Rotation — support multiple active keys in JWKS:**
+
+```json
+{
+  "keys": [
+    { "kid": "key-2025-q1", "kty": "RSA", "use": "sig", "alg": "RS256", "n": "...", "e": "AQAB" },
+    { "kid": "key-2025-q2", "kty": "RSA", "use": "sig", "alg": "RS256", "n": "...", "e": "AQAB" }
+  ]
+}
+```
+
+New tokens are signed with the latest key. Old tokens (signed with the previous key) still verify — the `kid` header tells verifiers which public key to use. Clients rotating transparently because they always fetch JWKS dynamically.
+
+**Token Introspection endpoint ([RFC 7662](https://datatracker.ietf.org/doc/html/rfc7662)):**
+
+```
+POST /introspect
+  token=ACCESS_TOKEN
+  token_type_hint=access_token
+
+Response:
+{
+  "active": true,
+  "sub": "user-001",
+  "scope": "transactions:read",
+  "exp": 1711929600,
+  "client_id": "web-app"
+}
+```
+
+Resource servers that cannot verify JWTs locally (e.g. legacy services, third-party APIs) call introspect instead. The auth server checks the token against its database and returns whether it is active. This is how PingFederate integrates with non-JWT-aware systems.
+
+**Token Revocation endpoint ([RFC 7009](https://datatracker.ietf.org/doc/html/rfc7009)):**
+
+```
+POST /revoke
+  token=REFRESH_TOKEN
+  token_type_hint=refresh_token
+```
+
+When a user logs out or a client is compromised, the refresh token is immediately invalidated in the database. All subsequent refresh attempts fail. This is critical because JWTs themselves cannot be un-issued — revocation works by refusing to honor the refresh token.
+
+**Add MFA (TOTP) to the login flow:**
+
+```
+Current login:   username + password → auth code issued
+With MFA:        username + password → TOTP challenge → auth code issued
+
+The /authorize handler checks if the user has MFA enabled.
+If yes: redirect to /mfa instead of issuing the code immediately.
+/mfa: shows TOTP input form, verifies 6-digit code against TOTP secret.
+On success: redirect back to issue the auth code.
+```
+
+---
+
+### Part B — Build the Authz Facade Layer
+
+This is the layer Autodesk built on top of PingFederate. It is a separate Go service that sits between consumers (your apps, developer portals, third-party integrations) and the auth server. Its purpose: provide a clean, stable REST API so that consumers never need to know the auth server's internal API.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  CONSUMERS                                                          │
+│  (web apps, developer portals, internal services, partner APIs)    │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │ Clean REST API — never changes
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  AUTHZ SERVICE  (what you build in Part B)                          │
+│                                                                     │
+│  Three APIs:                                                        │
+│   1. OAuth2 Client Management API                                   │
+│   2. OAuth2 Token Management API                                    │
+│   3. Personal Access Token (PAT) API                                │
+│                                                                     │
+│  Built with go-kit (transport → endpoint → service layers)          │
+└──────────────┬───────────────────────────────┬──────────────────────┘
+               │                               │
+               ▼                               ▼
+    ┌─────────────────────┐         ┌──────────────────────┐
+    │  YOUR AUTH SERVER   │         │  AMAZON DYNAMODB     │
+    │  (Part A)           │         │  (or PostgreSQL)     │
+    │                     │         │                      │
+    │  Issues tokens      │         │  PAT store           │
+    │  Manages clients    │         │  Token metadata      │
+    │  Runs OAuth flows   │         │  Audit logs          │
+    └─────────────────────┘         └──────────────────────┘
+```
+
+**API 1 — OAuth2 Client Management (CRUD on the auth server's client registry):**
+
+```
+POST   /clients              Register a new OAuth client
+GET    /clients              List all registered clients
+GET    /clients/{client_id}  Get a specific client
+PUT    /clients/{client_id}  Update client (redirect URIs, scopes, name)
+DELETE /clients/{client_id}  Deregister a client
+
+Internally: Authz calls your auth server's admin API (or directly writes
+to the oauth_clients table) and returns a clean, versioned REST response.
+```
+
+This abstraction means: if you replace the auth server (e.g. swap your Go server for Ory Hydra), only Authz changes. The 50 consumers using the Client Management API don't change at all.
+
+**API 2 — OAuth2 Token Management (orchestration between auth server and DynamoDB):**
+
+```
+POST /tokens/exchange         Exchange an auth code for tokens
+                              (Authz calls /token on auth server,
+                               stores metadata in DynamoDB, returns tokens)
+
+POST /tokens/refresh          Refresh an access token
+                              (Authz calls /token with refresh grant,
+                               updates DynamoDB record, returns new token)
+
+POST /tokens/revoke           Revoke a token
+                              (Authz calls /revoke on auth server AND
+                               marks the DynamoDB record as revoked)
+
+GET  /tokens/{token_id}/info  Get token metadata
+                              (Authz reads DynamoDB — no auth server call needed)
+```
+
+Why does DynamoDB exist alongside the auth server? The auth server's token endpoint returns tokens but stores minimal metadata. DynamoDB holds the full audit trail: which user, which client, which scopes, when issued, when last refreshed, from which IP. This data is needed for dashboards, anomaly detection, and compliance — none of which belong inside the auth server itself.
+
+**API 3 — Personal Access Token (PAT) Management:**
+
+PATs are long-lived developer tokens (like GitHub's `ghp_xxxx` or AWS access keys). OAuth access tokens expire in 1 hour. PATs are designed to last months or years and are used in scripts, CI/CD pipelines, and API integrations where a human cannot approve a login flow.
+
+```
+POST   /pats              Create a new PAT
+                          Body: { name: "CI Pipeline", scopes: ["read"], expires_in: "90d" }
+                          Authz generates a random token, stores it hashed in DynamoDB,
+                          returns the raw token ONCE (never shown again, like GitHub)
+
+GET    /pats              List my PATs (name, scopes, last_used, expires_at — never the token)
+DELETE /pats/{pat_id}     Revoke a PAT immediately
+
+Validation (by resource servers):
+  Authorization: Bearer pat_xxxxxxxxxxxx
+  Resource server calls: POST /pats/introspect  { token: "pat_xxx" }
+  Authz: looks up SHA-256(token) in DynamoDB → returns active/inactive + scopes
+```
+
+PAT data model in DynamoDB:
+
+```
+PK: pat#sha256(token)        ← never store raw PAT, only its hash
+SK: user#{user_id}
+
+Attributes:
+  pat_id:      "pat_abc123"  ← stable ID for listing/revocation
+  name:        "CI Pipeline"
+  scopes:      ["transactions:read"]
+  user_id:     "user-001"
+  created_at:  "2025-01-15T10:00:00Z"
+  expires_at:  "2025-04-15T10:00:00Z"
+  last_used:   "2025-03-28T14:22:00Z"
+  revoked:     false
+```
+
+**go-kit Service Structure:**
+
+Autodesk's Authz uses go-kit, which enforces a strict three-layer architecture:
+
+```go
+// Layer 1 — Service: pure business logic, no HTTP knowledge
+type Service interface {
+    CreateClient(ctx context.Context, req CreateClientRequest) (Client, error)
+    RevokeToken(ctx context.Context, tokenID string) error
+    CreatePAT(ctx context.Context, userID string, req CreatePATRequest) (PAT, string, error)
+    // string return = raw PAT token (shown once, then only hash stored)
+}
+
+// Layer 2 — Endpoint: converts service methods to request/response functions
+// go-kit wraps each method with logging, metrics, rate limiting, auth middleware here
+
+// Layer 3 — Transport: HTTP handlers that decode requests and encode responses
+// go-kit connects endpoints to HTTP routes here
+```
+
+This separation means: swap HTTP for gRPC by rewriting only the transport layer. The service logic is unchanged.
+
+**The Anti-Corruption Layer Pattern:**
+
+The deepest reason Authz exists: it is an Anti-Corruption Layer (ACL) between Autodesk's product domain and PingFederate's implementation domain.
+
+```
+Without Authz:
+  Developer Portal knows about PingFederate client IDs, grant types,
+  PingFederate-specific error codes, PingFederate's pagination format.
+  When PingFederate is upgraded, Developer Portal breaks.
+
+With Authz:
+  Developer Portal knows about Authz's stable API.
+  Authz translates between the two worlds.
+  PingFederate can be upgraded, replaced, or sharded — Authz absorbs the change.
+  Developer Portal never knows any of this happened.
+```
+
+---
+
+### The Full Enterprise Picture
+
+```
+This repo's authserver/    =  The core of what PingFederate does
+Part A additions           =  What makes it production-grade
+Part B (Authz)             =  The enterprise abstraction layer on top
+
+Together:
+  authserver (hardened)    ←→  Authz  ←→  All consumers
+                           ←→  DynamoDB (PAT store, token metadata, audit)
+```
+
+**Mastery signal at Level 5:** You can answer this question: "Why does Authz exist as a separate service instead of just giving consumers direct access to the auth server?"
+
+The answer: consumers need a stable contract. Auth servers are infrastructure that must be able to change (upgrades, migrations, scaling). The facade absorbs change so consumers don't have to. This is the same reason banks have ATMs instead of making customers interact with the core banking system directly.
